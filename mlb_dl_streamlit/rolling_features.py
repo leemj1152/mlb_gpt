@@ -1,254 +1,153 @@
-# rolling_features.py
-from __future__ import annotations
+# features.py (교체본)
 import pandas as pd
 import numpy as np
 
-# =========================
-# Helpers
-# =========================
+# 최근폼 df 스키마 가정:
+# columns 예시: ['team_id','team_name','date','g_played','win_pct','recent_winrate',
+#                'avg_gf_lb','avg_ga_lb','ewm_gf','ewm_ga','b2b','games_3g']
+# 팀 시즌스탯 df 스키마 가정:
+# ['team_id','team_name','season','W','L','win_pct_season','runs_per_game','runs_allowed_per_game', ...]
 
-def _to_ts(x) -> pd.Series:
-    s = pd.to_datetime(x, errors="coerce")
-    if getattr(s.dt, "tz", None) is not None:
-        s = s.dt.tz_convert(None)
-    return s
+SAFE_FILL = {
+    "win_pct": 0.5, "recent_winrate": 0.5,
+    "avg_gf_lb": 4.5, "avg_ga_lb": 4.5,
+    "ewm_gf": 4.5, "ewm_ga": 4.5,
+    "b2b": 0.0, "games_3g": 0.0,
+}
 
-def _prepare(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = df_raw.copy()
-    if "date" not in df.columns:
-        raise ValueError("input dataframe must contain 'date'")
+def _prep_recent(df_recent: pd.DataFrame) -> pd.DataFrame:
+    r = df_recent.copy()
+    # 결측 안전 채움
+    for c, v in SAFE_FILL.items():
+        if c in r.columns:
+            r[c] = r[c].fillna(v)
+    # 필요한 최소 컬럼 보장
+    need = ["team_id","team_name","date","g_played","win_pct","recent_winrate",
+            "avg_gf_lb","avg_ga_lb","ewm_gf","ewm_ga","b2b","games_3g"]
+    for c in need:
+        if c not in r.columns:
+            r[c] = SAFE_FILL.get(c, 0.0)
+    # 파생
+    r["ewm_diff"] = r["ewm_gf"] - r["ewm_ga"]
+    r["diff_avg_lb"] = r["avg_gf_lb"] - r["avg_ga_lb"]
+    return r
 
-    df["date"] = _to_ts(df["date"])
-    for c in ["home_score", "away_score"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    if "status" not in df.columns:
-        df["status"] = ""
+def _prep_team(df_team: pd.DataFrame) -> pd.DataFrame:
+    t = df_team.copy()
+    # 시즌 지표 없으면 생성(안전 기본값)
+    if "win_pct_season" not in t.columns:
+        if "W" in t.columns and "L" in t.columns:
+            t["win_pct_season"] = t["W"] / (t["W"] + t["L"]).replace(0, np.nan)
+        else:
+            t["win_pct_season"] = 0.5
+    t["win_pct_season"] = t["win_pct_season"].fillna(0.5)
+    if "runs_per_game" not in t.columns:
+        t["runs_per_game"] = t.get("R", pd.Series(0.0, index=t.index)) / \
+                             t.get("G", pd.Series(1.0, index=t.index)).replace(0, 1.0)
+    if "runs_allowed_per_game" not in t.columns:
+        t["runs_allowed_per_game"] = t.get("RA", pd.Series(0.0, index=t.index)) / \
+                                     t.get("G", pd.Series(1.0, index=t.index)).replace(0, 1.0)
+    t["season_diff_rg"] = t["runs_per_game"] - t["runs_allowed_per_game"]
+    return t
 
-    sort_cols = []
-    if "date" in df.columns:
-        sort_cols.append("date")
-    if "gamePk" in df.columns:
-        sort_cols.append("gamePk")
-    if sort_cols:
-        df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-    return df
+def _pick_latest_before(r: pd.DataFrame, date_col="date"):
+    # 한 팀당 가장 최근 1행 선택 (이미 recent가 최근치라면 그대로)
+    # 스케줄별 조인 시 game date기준으로 당일 이전 값으로 맞추는 게 이상적이나,
+    # 현 파이프라인(MLP)은 당일 스냅샷으로 쓰던 구조 → 여기선 "최신 한 줄" 사용
+    idx = r.groupby("team_id")[date_col].idxmax()
+    return r.loc[idx].reset_index(drop=True)
 
-def _as_long_team_games(df_hist: pd.DataFrame) -> pd.DataFrame:
-    home = pd.DataFrame({
-        "team_id": df_hist["home_id"].astype("Int64").values,
-        "team_name": df_hist.get("home_name", pd.Series([""]*len(df_hist))).values,
-        "date": df_hist["date"].values,
-        "is_home": 1,
-        "gf": df_hist["home_score"].astype("float64").values,
-        "ga": df_hist["away_score"].astype("float64").values,
-    })
-    away = pd.DataFrame({
-        "team_id": df_hist["away_id"].astype("Int64").values,
-        "team_name": df_hist.get("away_name", pd.Series([""]*len(df_hist))).values,
-        "date": df_hist["date"].values,
-        "is_home": 0,
-        "gf": df_hist["away_score"].astype("float64").values,
-        "ga": df_hist["home_score"].astype("float64").values,
-    })
-    long = pd.concat([home, away], ignore_index=True)
+def build_features(df_games: pd.DataFrame,
+                   df_team: pd.DataFrame,
+                   df_recent: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    입력:
+      - df_games: fetch_schedule(...) 결과, columns 예시:
+          ['gamePk','date','status','home_id','home_name','away_id','away_name','home_score','away_score', ...]
+      - df_team:  fetch_team_season_stats(...)
+      - df_recent: recent_form(fetch_schedule(...), n=10) 결과(팀별 최근폼 스냅샷 누적)
 
-    long["win"] = np.where(
-        (long["gf"].notna()) & (long["ga"].notna()),
-        (long["gf"] > long["ga"]).astype(int),
-        np.nan
-    )
-    long = long.sort_values(["team_id", "date"], kind="mergesort").reset_index(drop=True)
-    return long
+    출력:
+      - Xfeat: 학습/추론 피처 (gamePk 포함)
+      - merged: 메타(표시용) 포함 원본+피처 일부
+    """
+    games = df_games.copy()
+    # 타입/결측 정리
+    games["date"] = pd.to_datetime(games["date"])
+    for c in ["home_id","away_id"]:
+        if c in games.columns:
+            games[c] = pd.to_numeric(games[c], errors="coerce").astype("Int64")
 
-def compute_team_rollups(df_done: pd.DataFrame, lookback: int = 10) -> pd.DataFrame:
-    long = _as_long_team_games(df_done)
+    team = _prep_team(df_team)
+    recent = _prep_recent(df_recent)
 
-    played_mask = (long["gf"].notna()) & (long["ga"].notna())
-    long["played"] = played_mask.astype(int)
+    # 각 팀 최신 스냅샷 선택
+    snap_latest = _pick_latest_before(recent)
 
-    long["g_played"] = long.groupby("team_id")["played"].transform("cumsum")
-    long["win_cum"]  = long.groupby("team_id")["win"].transform(lambda s: s.fillna(0).cumsum())
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        long["win_pct"] = (long["win_cum"] / long["g_played"].replace(0, np.nan)).astype("float64")
-
-    grp = long.groupby("team_id", group_keys=False)
-
-    long["recent_winrate"] = grp["win"].apply(
-        lambda s: s.fillna(0).rolling(window=lookback, min_periods=1).mean()
-    ).values
-
-    long["avg_gf_lb"] = grp["gf"].apply(
-        lambda s: s.ffill().rolling(window=lookback, min_periods=1).mean()
-    ).values
-    long["avg_ga_lb"] = grp["ga"].apply(
-        lambda s: s.ffill().rolling(window=lookback, min_periods=1).mean()
-    ).values
-    long["diff_avg_lb"] = (long["avg_gf_lb"] - long["avg_ga_lb"]).astype("float64")
-
-    long["gf_ewm"] = grp["gf"].apply(lambda s: s.ffill().ewm(span=lookback, min_periods=1, adjust=False).mean()).values
-    long["ga_ewm"] = grp["ga"].apply(lambda s: s.ffill().ewm(span=lookback, min_periods=1, adjust=False).mean()).values
-    long["ewm_diff"] = (long["gf_ewm"] - long["ga_ewm"]).astype("float64")
-
-    long["prev_date"] = grp["date"].shift(1)
-    long["b2b"] = ((long["date"] - long["prev_date"]).dt.days == 1).astype("int8").fillna(0)
-
-    long["games_3g"] = grp["played"].apply(
-        lambda s: s.rolling(window=3, min_periods=1).sum()
-    ).astype("int16").values
-
-    snaps = long[[
-        "team_id", "date",
-        "g_played", "win_pct", "recent_winrate",
-        "avg_gf_lb", "avg_ga_lb", "diff_avg_lb",
-        "gf_ewm", "ga_ewm", "ewm_diff",
-        "b2b", "games_3g"
-    ]].copy()
-
-    snaps["team_id"] = snaps["team_id"].astype("Int64")
-    snaps["date"] = pd.to_datetime(snaps["date"], errors="coerce")
-    snaps = snaps.dropna(subset=["date"]).sort_values(["team_id","date"], kind="mergesort").reset_index(drop=True)
-    return snaps
-
-def _monotonic_ok(df: pd.DataFrame) -> bool:
-    # 팀별 날짜가 단조 증가인지 확인
-    g = df.groupby("team_id")["date"].apply(lambda s: s.is_monotonic_increasing)
-    return bool(g.all())
-
-def _merge_side_features(left_df: pd.DataFrame, snaps: pd.DataFrame, side: str) -> pd.DataFrame:
-    """팀별로 쪼개서 asof-merge (정렬/타입 문제 확실히 회피)"""
-    sid = f"{side}_id"
-    if sid not in left_df.columns:
-        raise ValueError(f"left_df must contain '{sid}'")
-
-    # 준비: dtype 통일 + 결측 제거
-    tmp_left = left_df.rename(columns={sid: "team_id"}).copy()
-    tmp_left["team_id"] = pd.to_numeric(tmp_left["team_id"], errors="coerce").astype("Int64")
-    tmp_left["date"] = pd.to_datetime(tmp_left["date"], errors="coerce")
-    tmp_left = tmp_left.dropna(subset=["team_id", "date"]).copy()
-    # asof 요구: int64(non-nullable)로 바꿔 안정성 확보
-    tmp_left["team_id"] = tmp_left["team_id"].astype("int64")
-
-    snaps_s = snaps.copy()
-    snaps_s["team_id"] = pd.to_numeric(snaps_s["team_id"], errors="coerce").astype("Int64")
-    snaps_s["date"] = pd.to_datetime(snaps_s["date"], errors="coerce")
-    snaps_s = snaps_s.dropna(subset=["team_id", "date"]).copy()
-    snaps_s["team_id"] = snaps_s["team_id"].astype("int64")
-
-    parts = []
-    # 팀별 분할 머지 (각 부분에서 date 정렬 보장)
-    for tid, lpart in tmp_left.groupby("team_id", sort=False):
-        spart = snaps_s[snaps_s["team_id"] == tid]
-        if spart.empty:
-            # 스냅샷이 없으면 NaN으로 채워진 행 유지
-            parts.append(lpart)
-            continue
-        lpart = lpart.sort_values("date", kind="mergesort")
-        spart = spart.sort_values("date", kind="mergesort")
-
-        m = pd.merge_asof(
-            lpart, spart.drop(columns=["team_id"]),
-            on="date",
-            direction="backward",
-            allow_exact_matches=False
+    # 홈/원정에 시즌스탯, 최근폼 붙이기
+    def _side_merge(side: str):
+        id_col = f"{side}_id"
+        name_col = f"{side}_name"
+        out = games[[ "gamePk","date", id_col, name_col ]].rename(
+            columns={id_col:"team_id", name_col:"team_name"}
         )
-        parts.append(m)
+        # 시즌스탯
+        out = out.merge(
+            team[["team_id","win_pct_season","runs_per_game","runs_allowed_per_game","season_diff_rg"]],
+            on="team_id", how="left", suffixes=("","")
+        )
+        # 최근폼(최신 스냅샷)
+        out = out.merge(
+            snap_latest[["team_id","win_pct","recent_winrate","avg_gf_lb","avg_ga_lb",
+                         "ewm_gf","ewm_ga","ewm_diff","diff_avg_lb","b2b","games_3g"]],
+            on="team_id", how="left", suffixes=("","")
+        )
+        # 접두사
+        out = out.add_prefix(f"{side}_")
+        out = out.rename(columns={f"{side}_gamePk":"gamePk", f"{side}_date":"date"})
+        return out
 
-    merged = pd.concat(parts, ignore_index=True)
-    # 원래 컬럼명으로 복구
-    merged = merged.rename(columns={"team_id": sid})
-    return merged
+    H = _side_merge("home")
+    A = _side_merge("away")
 
-def _build_diff_features(base: pd.DataFrame) -> pd.DataFrame:
-    keep_meta = ["gamePk", "date", "home_id", "away_id", "home_name", "away_name", "status", "home_score", "away_score"]
-    meta_cols = [c for c in keep_meta if c in base.columns]
-    num_cols = [
-        "g_played", "win_pct", "recent_winrate",
-        "avg_gf_lb", "avg_ga_lb", "diff_avg_lb",
-        "gf_ewm", "ga_ewm", "ewm_diff",
-        "b2b", "games_3g"
+    merged = games.merge(H, on=["gamePk","date"], how="left").merge(A, on=["gamePk","date"], how="left")
+
+    # 차이 피처(홈 - 원정)
+    diff_map = {
+        "win_pct_season": ("home_win_pct_season","away_win_pct_season"),
+        "runs_per_game": ("home_runs_per_game","away_runs_per_game"),
+        "runs_allowed_per_game": ("home_runs_allowed_per_game","away_runs_allowed_per_game"),
+        "season_diff_rg": ("home_season_diff_rg","away_season_diff_rg"),
+
+        "win_pct": ("home_win_pct","away_win_pct"),
+        "recent_winrate": ("home_recent_winrate","away_recent_winrate"),
+        "avg_gf_lb": ("home_avg_gf_lb","away_avg_gf_lb"),
+        "avg_ga_lb": ("home_avg_ga_lb","away_avg_ga_lb"),
+        "ewm_gf": ("home_ewm_gf","away_ewm_gf"),
+        "ewm_ga": ("home_ewm_ga","away_ewm_ga"),
+        "ewm_diff": ("home_ewm_diff","away_ewm_diff"),
+        "diff_avg_lb": ("home_diff_avg_lb","away_diff_avg_lb"),
+        "b2b": ("home_b2b","away_b2b"),
+        "games_3g": ("home_games_3g","away_games_3g"),
+    }
+
+    for feat, (hcol, acol) in diff_map.items():
+        merged[f"diff_{feat}"] = merged[hcol].fillna(SAFE_FILL.get(feat, 0.0)) - \
+                                 merged[acol].fillna(SAFE_FILL.get(feat, 0.0))
+
+    # 최종 피처 선택
+    feat_cols = [
+        "diff_win_pct_season","diff_runs_per_game","diff_runs_allowed_per_game","diff_season_diff_rg",
+        "diff_win_pct","diff_recent_winrate","diff_avg_gf_lb","diff_avg_ga_lb",
+        "diff_ewm_gf","diff_ewm_ga","diff_ewm_diff","diff_diff_avg_lb",
+        "diff_b2b","diff_games_3g",
     ]
-    feats = {}
-    for col in num_cols:
-        h, a = f"home_{col}", f"away_{col}"
-        if h in base.columns and a in base.columns:
-            feats[f"diff_{col}"] = (base[h] - base[a]).astype("float64")
-    X = pd.concat([base[meta_cols], pd.DataFrame(feats, index=base.index)], axis=1)
-    return X
 
-# =========================
-# Public APIs
-# =========================
+    Xfeat = merged[["gamePk"] + feat_cols].copy()
 
-def build_game_features_from_history(df_hist: pd.DataFrame, target_date: str, lookback: int = 10):
-    df_hist = _prepare(df_hist)
-    td = pd.to_datetime(target_date)
+    # 남겨둘 메타(앱 표시용)
+    meta_cols = ["gamePk","date","status","home_name","away_name","home_score","away_score"]
+    meta_cols = [c for c in meta_cols if c in merged.columns]
+    merged_meta = merged[meta_cols].copy()
 
-    df_today = df_hist.loc[df_hist["date"].dt.date == td.date()].copy()
-    if df_today.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    df_done = df_hist.loc[df_hist["date"] < td].copy()
-    snaps = compute_team_rollups(df_done, lookback=lookback)
-
-    home = _merge_side_features(df_today[["gamePk","date","home_id"]], snaps, side="home")
-    away = _merge_side_features(df_today[["gamePk","date","away_id"]], snaps, side="away")
-
-    merged = df_today.merge(home, on=["gamePk","date"], how="left") \
-                     .merge(away, on=["gamePk","date"], how="left")
-
-    # 접두사 정리
-    for col in ["g_played","win_pct","recent_winrate","avg_gf_lb","avg_ga_lb","diff_avg_lb","gf_ewm","ga_ewm","ewm_diff","b2b","games_3g"]:
-        hx, hy = f"{col}_x", f"{col}_y"
-        if hx in merged.columns and f"home_{col}" not in merged.columns:
-            merged = merged.rename(columns={hx: f"home_{col}"})
-        if hy in merged.columns and f"away_{col}" not in merged.columns:
-            merged = merged.rename(columns={hy: f"away_{col}"})
-
-    X = _build_diff_features(merged)
-    return X, merged
-
-def build_training_set_rolling(df_hist: pd.DataFrame, train_end: str, lookback: int = 10):
-    df_hist = _prepare(df_hist)
-    te = pd.to_datetime(train_end)
-
-    base = df_hist.loc[df_hist["date"] <= te].copy()
-    if base.empty:
-        return pd.DataFrame(), pd.Series(dtype="int8"), pd.DataFrame()
-
-    has_score = base["home_score"].notna() & base["away_score"].notna()
-    base_labeled = base.loc[has_score].copy()
-    if base_labeled.empty:
-        return pd.DataFrame(), pd.Series(dtype="int8"), pd.DataFrame()
-
-    snaps = compute_team_rollups(base, lookback=lookback)
-
-    left_home = base_labeled[["gamePk","date","home_id"]]
-    left_away = base_labeled[["gamePk","date","away_id"]]
-
-    home = _merge_side_features(left_home, snaps, side="home")
-    away = _merge_side_features(left_away, snaps, side="away")
-
-    merged = base_labeled.merge(home, on=["gamePk","date"], how="left") \
-                         .merge(away, on=["gamePk","date"], how="left")
-
-    for col in ["g_played","win_pct","recent_winrate","avg_gf_lb","avg_ga_lb","diff_avg_lb","gf_ewm","ga_ewm","ewm_diff","b2b","games_3g"]:
-        hx, hy = f"{col}_x", f"{col}_y"
-        if hx in merged.columns and f"home_{col}" not in merged.columns:
-            merged = merged.rename(columns={hx: f"home_{col}"})
-        if hy in merged.columns and f"away_{col}" not in merged.columns:
-            merged = merged.rename(columns={hy: f"away_{col}"})
-
-    Xall = _build_diff_features(merged)
-    y = (merged["home_score"] > merged["away_score"]).astype("int8")
-
-    feat_cols = [c for c in Xall.columns if c.startswith("diff_")]
-    X = pd.concat([merged[["gamePk","date"]], Xall[feat_cols]], axis=1)
-
-    mask = X[feat_cols].notna().all(axis=1)
-    X = X.loc[mask].reset_index(drop=True)
-    y = y.loc[mask.values].reset_index(drop=True)
-    merged = merged.loc[mask.values].reset_index(drop=True)
-
-    return X, y, merged
+    return Xfeat, merged_meta
